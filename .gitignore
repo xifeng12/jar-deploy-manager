@@ -1,0 +1,14 @@
+servers.json
+settings.json
+*.log
+_flask*
+data/
+jars/
+logs/
+known_hosts
+build/
+dist/
+release/
+__pycache__/
+.pytest_cache/
+frontend/.ctx-plan-dist/
