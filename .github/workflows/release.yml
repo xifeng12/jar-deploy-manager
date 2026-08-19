@@ -14,7 +14,7 @@ jobs:
         with: { python-version: '3.11' }
       - uses: actions/setup-node@v4
         with: { node-version: '22', cache: npm }
-      - run: pip install -r requirements.txt pyinstaller
+      - run: pip install -r requirements.txt pyinstaller pytest
       - run: npm ci
       - run: npm run build
       - run: python -m pytest -q
