@@ -18,7 +18,7 @@ function getJarName(jar) {
 }
 
 function normalizeJarName(name) {
-  return String(name || '').replace(/\s*\(\d+\)(?=\.jar$)/i, '');
+  return String(name || '').normalize('NFKC').split(/[\\/]/).pop().replace(/(?:\s*\(\d+\))+(?=\.jar$)/i, '');
 }
 
 function formatSize(bytes) {
@@ -79,7 +79,6 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('deploy');
   const [servers, setServers] = useState([]);
   const [jars, setJars] = useState([]);
-  const [selectedServers, setSelectedServers] = useState(new Set());
   const [selectedJars, setSelectedJars] = useState(new Set());
   const [serverSearch, setServerSearch] = useState('');
   const [logs, setLogs] = useState([{ message: '等待部署...', level: 'info', empty: true }]);
@@ -119,6 +118,9 @@ export default function App() {
   });
   const fileInputRef = useRef(null);
   const logRef = useRef(null);
+  const operationIdRef = useRef(null);
+  const operationVersionRef = useRef(0);
+  const connectionRequestsRef = useRef(new Map());
 
   useEffect(() => {
     document.body.classList.toggle('dark-mode', darkMode);
@@ -130,13 +132,39 @@ export default function App() {
     loadJars().then(loadServers);
     loadLogHistory();
     loadScheduledTasks();
+    loadOperationStatus().catch((error) => toast(error.message, 'error'));
   }, []);
 
   useEffect(() => {
     if (!window.io) return;
     const socket = window.io();
-    socket.on('connect', () => addLog('已连接到部署服务', 'info'));
+    socket.on('connect', () => {
+      addLog('已连接到部署服务', 'info');
+      loadOperationStatus().catch((error) => toast(error.message, 'error'));
+    });
     socket.on('log', (data) => addLog(data.message, data.level));
+    socket.on('operation_started', (data) => {
+      operationVersionRef.current++;
+      applyOperationStatus(data);
+    });
+    socket.on('operation_done', (data) => {
+      operationVersionRef.current++;
+      if (!operationIdRef.current || operationIdRef.current === data.operation_id) {
+        applyOperationStatus(data);
+      }
+      loadLogHistory();
+      const action = { deploy: '部署', restart: '重启', rollback: '回滚' }[data.operation] || '任务';
+      const ending = data.status === 'cancelled' ? '已取消' : data.status === 'failed' ? '失败' : '完成';
+      toast(`${action}${ending}：成功 ${data.success || 0}，失败 ${data.fail || 0}，跳过 ${data.skip || 0}`, data.status === 'failed' ? 'error' : data.status === 'cancelled' ? 'warning' : 'success');
+    });
+    socket.on('test_result', ({ ip, request_id: requestId, result }) => {
+      if (connectionRequestsRef.current.get(ip) !== requestId) return;
+      connectionRequestsRef.current.delete(ip);
+      setServers((items) => items.map((server) => (
+        server.ip === ip ? { ...server, _status: result.success ? 'ok' : 'fail' } : server
+      )));
+      toast(`${ip} ${result.message || (result.success ? '连接成功' : '连接失败')}`, result.success ? 'success' : 'error');
+    });
     socket.on('download_done', (data) => {
       const message = data.fail
         ? `日志下载完成: 成功 ${data.success} 个, 失败 ${data.fail} 个`
@@ -167,11 +195,19 @@ export default function App() {
       ...items.filter((item) => !item.empty),
       { message, level }
     ]);
-    if (String(message).includes('部署完成') || String(message).includes('重启完成') || String(message).includes('部署已取消')) {
-      setBusy(false);
-      setBusyAction('');
-      loadLogHistory();
-    }
+  }
+
+  function applyOperationStatus(data) {
+    const running = data.status === 'running';
+    operationIdRef.current = running ? data.operation_id : null;
+    setBusy(running);
+    setBusyAction(running ? data.operation : '');
+  }
+
+  async function loadOperationStatus() {
+    const version = operationVersionRef.current;
+    const data = await readActionResult(await fetch('/api/deploy/status'));
+    if (version === operationVersionRef.current) applyOperationStatus(data);
   }
 
   async function loadSettings() {
@@ -394,6 +430,17 @@ export default function App() {
     });
   }
 
+  function toggleServer(server) {
+    const localNames = new Set(jars.map(getJarName));
+    const names = (server.jars || []).map(getJarName).filter((name) => localNames.has(name));
+    const deselect = selectedServers.has(server.ip);
+    setSelectedJars((prev) => {
+      const next = new Set(prev);
+      names.forEach((name) => deselect ? next.delete(name) : next.add(name));
+      return next;
+    });
+  }
+
   function findServersForJar(jarName, serverList = servers) {
     const targetName = normalizeJarName(jarName);
     return serverList.filter((server) => (
@@ -412,9 +459,6 @@ export default function App() {
 
     if (syncDeploySelection) {
       setSelectedJars((prev) => new Set([...prev, ...names]));
-      if (relatedServers.size) {
-        setSelectedServers((prev) => new Set([...prev, ...relatedServers]));
-      }
     }
 
     setScheduleDraft((draft) => ({
@@ -443,22 +487,32 @@ export default function App() {
           const item = typeof jar === 'string' ? { name: jar, script: '' } : jar;
           return item.name.toLowerCase().includes(query) || (item.script || '').toLowerCase().includes(query);
         });
-        return matchedJars.length ? { ...server, jars: matchedJars } : null;
+        return matchedJars.length ? { ...server, visibleJars: matchedJars } : null;
       })
       .filter(Boolean);
   }
 
   async function testConnection(ip) {
-    toast(`正在测试 ${ip}...`, 'info');
-    const data = await fetch('/api/test-connection', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ip })
-    }).then((res) => res.json());
+    const requestId = `${Date.now()}-${Math.random()}`;
+    connectionRequestsRef.current.set(ip, requestId);
     setServers((items) => items.map((server) => (
-      server.ip === ip ? { ...server, _status: data.success ? 'ok' : 'fail' } : server
+      server.ip === ip ? { ...server, _status: 'testing' } : server
     )));
-    toast(data.success ? `${ip} 连接成功` : `${ip} 连接失败`, data.success ? 'success' : 'error');
+    toast(`正在测试 ${ip}...`, 'info');
+    try {
+      await readActionResult(await fetch('/api/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip, request_id: requestId })
+      }));
+    } catch (error) {
+      if (connectionRequestsRef.current.get(ip) !== requestId) return;
+      connectionRequestsRef.current.delete(ip);
+      setServers((items) => items.map((server) => (
+        server.ip === ip ? { ...server, _status: 'fail' } : server
+      )));
+      toast(`${ip} ${error.message || '测试请求失败'}`, 'error');
+    }
   }
 
   function testAllServers() {
@@ -491,17 +545,29 @@ export default function App() {
   }
 
   async function postRestart(items) {
+    await submitOperation('restart', { items }, '重启请求已提交');
+  }
+
+  async function submitOperation(operation, payload, message) {
+    if (busy) {
+      toast('已有任务正在执行，请等待任务完成', 'warning');
+      return;
+    }
+    operationVersionRef.current++;
+    operationIdRef.current = 'pending';
     setBusy(true);
-    setBusyAction('restart');
-    const data = await fetch('/api/restart', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items })
-    }).then((res) => res.json());
-    toast(data.success ? '重启请求已提交' : (data.error || '重启失败'), data.success ? 'success' : 'error');
-    if (!data.success) {
-      setBusy(false);
-      setBusyAction('');
+    setBusyAction(operation);
+    try {
+      await readActionResult(await fetch(`/api/${operation}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }));
+      toast(message, 'success');
+    } catch (error) {
+      toast(error.message || '任务请求失败', 'error');
+    } finally {
+      await loadOperationStatus().catch(() => toast('无法获取任务状态，重新连接后将自动同步', 'warning'));
     }
   }
 
@@ -513,25 +579,13 @@ export default function App() {
       return;
     }
     if (!confirm(`确定部署 ${selectedJarList.length} 个JAR到 ${selectedServerList.length} 台服务器吗？`)) return;
-    setBusy(true);
-    setBusyAction('deploy');
-    const data = await fetch('/api/deploy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ servers: selectedServerList, jars: selectedJarList })
-    }).then((res) => res.json());
-    toast(data.success ? '部署请求已提交' : (data.error || '部署失败'), data.success ? 'success' : 'error');
-    if (!data.success) {
-      setBusy(false);
-      setBusyAction('');
-    }
+    await submitOperation('deploy', { servers: selectedServerList, jars: selectedJarList }, '部署请求已提交');
   }
 
   async function startRestart() {
-    const items = [];
-    selectedServers.forEach((server) => {
-      selectedJars.forEach((jar) => items.push({ server, jar }));
-    });
+    const items = selectedJarNames.flatMap((jar) => (
+      findServersForJar(jar).map((server) => ({ server: server.ip, jar }))
+    ));
     if (!items.length) {
       toast('请选择服务器和JAR包', 'warning');
       return;
@@ -743,6 +797,8 @@ export default function App() {
       setServerModalOpen(false);
       await loadServers();
       toast('保存成功', 'success');
+    } else {
+      toast(data.error || '保存失败', 'error');
     }
   }
 
@@ -760,11 +816,6 @@ export default function App() {
       toast(error.message || '删除失败', 'error');
       return;
     }
-    setSelectedServers((prev) => {
-      const next = new Set(prev);
-      next.delete(ip);
-      return next;
-    });
     setServerModalOpen(false);
     await loadServers();
     toast('删除成功', 'success');
@@ -819,6 +870,9 @@ export default function App() {
   const visibleServers = filteredServers();
   const currentJarNames = jars.map((jar) => jar.name);
   const selectedJarNames = currentJarNames.filter((name) => selectedJars.has(name));
+  const selectedServers = new Set(selectedJarNames.flatMap((name) => (
+    findServersForJar(name).map((server) => server.ip)
+  )));
   const allJarsSelected = currentJarNames.length > 0 && selectedJarNames.length === currentJarNames.length;
   const selectedInfo = `已选: ${selectedServers.size} 服务器, ${selectedJarNames.length} JAR包`;
   const jarOptions = Array.from(new Set([
@@ -869,15 +923,15 @@ export default function App() {
                 </div>
                 <div className="scroll-pane server-pane">
                   {visibleServers.length === 0 ? <Empty icon="bi-hdd-network" text="暂无服务器，请点击添加" /> : visibleServers.map((server) => (
-                    <div key={server.ip} className={`server-item ${selectedServers.has(server.ip) ? 'selected' : ''}`} data-status={server._status || ''} onClick={() => toggleSet(setSelectedServers, server.ip)}>
+                    <div key={server.ip} className={`server-item ${selectedServers.has(server.ip) ? 'selected' : ''}`} data-status={server._status || ''} onClick={() => toggleServer(server)}>
                       <div className="d-flex justify-content-between align-items-center">
                         <div className="d-flex align-items-center gap-2">
-                          <input type="checkbox" className="form-check-input" checked={selectedServers.has(server.ip)} onChange={() => toggleSet(setSelectedServers, server.ip)} onClick={(e) => e.stopPropagation()} />
+                          <input type="checkbox" className="form-check-input" checked={selectedServers.has(server.ip)} onChange={() => toggleServer(server)} onClick={(e) => e.stopPropagation()} />
                           <span className="server-identity">
                             <span className="server-name-label">{server.name || '未命名服务器'}</span>
                             <span className="ip-label">{server.ip}</span>
                           </span>
-                          {server._status && <span className={`badge ${server._status === 'ok' ? 'bg-success' : 'bg-danger'}`}>{server._status === 'ok' ? '在线' : '离线'}</span>}
+                          {server._status && <span className={`badge ${server._status === 'ok' ? 'bg-success' : server._status === 'testing' ? 'bg-warning text-dark' : 'bg-danger'}`}>{server._status === 'ok' ? '在线' : server._status === 'testing' ? '测试中' : '离线'}</span>}
                         </div>
                         <div className="d-flex gap-1">
                           <ActionIcon type="restart" icon="bi-arrow-repeat" title="重启该服务器所有服务" onClick={(e) => { e.stopPropagation(); restartServer(server); }} />
@@ -888,7 +942,7 @@ export default function App() {
                       </div>
                       {(server.jars || []).length > 0 && (
                         <div className="server-jars">
-                          {(server.jars || []).map((jar) => {
+                          {(server.visibleJars || server.jars || []).map((jar) => {
                             const name = getJarName(jar);
                             const hasFile = jars.some((file) => file.name === name);
                             return (
@@ -983,7 +1037,7 @@ export default function App() {
                   {!history.length ? <Empty icon="bi-clock-history" text="暂无历史记录" /> : history.slice(0, 30).map((row) => (
                     <div className="list-group-item" key={row.id || row.created_at}>
                       <div className="d-flex justify-content-between align-items-center">
-                        <strong className={row.status === 'done' || row.status === 'restart' ? 'text-success' : 'text-danger'}>{row.status}</strong>
+                        <strong className={['done', 'restart', 'completed'].includes(String(row.status || '').split(':').pop()) ? 'text-success' : 'text-danger'}>{row.status}</strong>
                         <small className="text-muted">{row.created_at || ''}</small>
                       </div>
                       <div className="small text-muted">服务器: {(row.servers || []).join(', ') || '-'}</div>
@@ -1233,6 +1287,7 @@ function ScheduledPanel({ draft, setDraft, serverOptions, setScheduleServers, cr
     completed: ['bg-success', '已完成'],
     failed: ['bg-danger', '失败'],
     cancelled: ['bg-secondary', '已取消'],
+    interrupted: ['bg-warning text-dark', '已中断'],
     expired: ['bg-dark', '已过期']
   };
   const typeMap = { deploy: '部署', restart: '重启' };

@@ -1,22 +1,31 @@
 import os
-import re
 import threading
 import logging
-import unicodedata
 import time
 import urllib.request
 import webbrowser
+from ipaddress import ip_address
 from flask import Flask, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit
-from deploy_service import DeployService, ScheduleTaskManager
+from deploy_service import DeployService, ScheduleTaskManager, build_jar_plan, validate_restart_items
 from crypto_utils import SecretEncryptionError, encrypt, is_encrypted
-from db import get_all_servers, add_server, update_server, delete_server, get_all_settings, set_settings
+from db import get_all_servers, add_server, update_server, delete_server, get_all_settings, set_settings, get_deploy_history
+from jar_names import normalize_jar_name, normalize_jar_names
 from runtime_paths import ensure_runtime_directories, get_runtime_paths, resource_dir
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.urandom(24)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=(
+        "http://127.0.0.1:5000",
+        "http://localhost:5000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ),
+    async_mode="threading",
+)
 ensure_runtime_directories()
 
 SECRET_FIELDS = ("password", "jump_password", "server_key_passphrase", "jump_key_passphrase")
@@ -31,33 +40,37 @@ logging.basicConfig(level=logging.INFO)
 BASE_DIR = str(get_runtime_paths().home)
 
 
-def normalize_jar_name(filename):
-    filename = unicodedata.normalize("NFKC", os.path.basename(str(filename or "")))
-    return re.sub(r"(?:\s*\(\d+\))+(?=\.jar$)", "", filename, flags=re.IGNORECASE)
+def is_safe_jar_name(filename):
+    name = str(filename or "")
+    return bool(
+        name
+        and name == os.path.basename(name)
+        and "/" not in name
+        and "\\" not in name
+        and "\x00" not in name
+        and name.lower().endswith(".jar")
+    )
+
+
+def normalize_server_ip(value):
+    try:
+        return str(ip_address(str(value).strip()))
+    except ValueError:
+        return ""
 
 
 def resolve_jar_name(filename):
     target_core = deploy_service._extract_core(normalize_jar_name(filename))
     matches = {
-        jar["name"]
+        name
         for server in get_all_servers()
         for jar in server.get("jars", [])
-        if isinstance(jar, dict)
-        and jar.get("name")
-        and deploy_service._extract_core(jar["name"]) == target_core
+        for name in [jar.get("name") if isinstance(jar, dict) else jar]
+        if name
+        and is_safe_jar_name(name)
+        and deploy_service._extract_core(name) == target_core
     }
     return next(iter(matches)) if len(matches) == 1 else None
-
-
-def normalize_jar_names(names):
-    result = []
-    seen = set()
-    for name in names or []:
-        clean_name = normalize_jar_name(name)
-        if clean_name and clean_name not in seen:
-            result.append(clean_name)
-            seen.add(clean_name)
-    return result
 
 
 @app.route("/")
@@ -105,12 +118,24 @@ def servers():
     if request.method == "GET":
         return jsonify(get_all_servers())
     elif request.method == "POST":
-        data = request.json
-        add_server(data["ip"], data.get("jars", []), data.get("name", "").strip())
+        data = request.get_json(silent=True) or {}
+        server_ip = normalize_server_ip(data.get("ip"))
+        if not server_ip:
+            return jsonify({"success": False, "error": "服务器地址必须是合法IP"}), 400
+        try:
+            add_server(server_ip, data.get("jars", []), data.get("name", "").strip())
+        except ValueError as error:
+            return jsonify({"success": False, "error": str(error)}), 400
         return jsonify({"success": True})
     elif request.method == "PUT":
-        data = request.json
-        update_server(data["old_ip"], data["ip"], data.get("jars", []), data.get("name", "").strip())
+        data = request.get_json(silent=True) or {}
+        server_ip = normalize_server_ip(data.get("ip"))
+        if not data.get("old_ip") or not server_ip:
+            return jsonify({"success": False, "error": "服务器地址必须是合法IP"}), 400
+        try:
+            update_server(data["old_ip"], server_ip, data.get("jars", []), data.get("name", "").strip())
+        except ValueError as error:
+            return jsonify({"success": False, "error": str(error)}), 400
         return jsonify({"success": True})
     elif request.method == "DELETE":
         data = request.get_json(silent=True) or {}
@@ -153,7 +178,7 @@ def jars():
     if request.method == "GET":
         jars_list = []
         for f in os.listdir(jars_dir):
-            if f.endswith(".jar"):
+            if f.lower().endswith(".jar"):
                 path = os.path.join(jars_dir, f)
                 jars_list.append(
                     {
@@ -169,7 +194,7 @@ def jars():
         file = request.files["file"]
         if file.filename == "":
             return jsonify({"error": "No file selected"}), 400
-        if file.filename.endswith(".jar"):
+        if file.filename.lower().endswith(".jar"):
             clean_name = resolve_jar_name(file.filename)
             if not clean_name:
                 return jsonify({"error": "JAR名称未在服务器配置中唯一匹配"}), 400
@@ -221,31 +246,47 @@ def deploy():
     if unconfigured:
         return jsonify({"success": False, "error": f"以下服务器未配置JAR包: {', '.join(unconfigured)}"}), 400
 
+    try:
+        selected_servers = list(build_jar_plan(all_servers, selected_servers, selected_jars))
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+    if not selected_servers:
+        return jsonify({"success": False, "error": "请选择已关联服务器的JAR包"}), 400
 
-    def run_deploy():
-        deploy_service.deploy(selected_servers, selected_jars)
-        deploy_result = {
-            "servers": selected_servers,
-            "jars": selected_jars,
-            "success": deploy_service.last_deploy_success,
-            "fail": deploy_service.last_deploy_fail,
-        }
-        socketio.emit("deploy_done", deploy_result)
+    return _start_operation("deploy", deploy_service.deploy, selected_servers, selected_jars)
 
-    thread = threading.Thread(target=run_deploy)
-    thread.start()
 
-    return jsonify({"success": True, "task_id": thread.ident})
+def _start_operation(operation, action, *args):
+    operation_id = deploy_service.reserve_operation(operation)
+    if operation_id is None:
+        return jsonify({
+            "success": False,
+            "error": "已有部署、重启或回滚任务正在执行",
+            "operation_status": deploy_service.get_operation_status(),
+        }), 409
+    try:
+        thread = threading.Thread(target=lambda: action(*args, operation_id=operation_id))
+        thread.start()
+    except Exception:
+        deploy_service.release_reservation(operation_id)
+        app.logger.exception("无法启动%s任务", operation)
+        return jsonify({"success": False, "error": "无法启动任务，请稍后重试"}), 500
+    return jsonify({"success": True, "operation_id": operation_id, "task_id": thread.ident})
+
+
+@app.route("/api/deploy/status", methods=["GET"])
+def deploy_status():
+    return jsonify(deploy_service.get_operation_status())
+
+
+@app.route("/api/deploy/history", methods=["GET"])
+def deploy_history():
+    return jsonify(get_deploy_history())
 
 
 @app.route("/api/deploy/cancel", methods=["POST"])
 def cancel_deploy():
     deploy_service.cancel_deploy()
-    socketio.emit("deploy_done", {
-        "servers": [], "jars": [],
-        "success": deploy_service.last_deploy_success or 0,
-        "fail": 0, "cancelled": True,
-    })
     return jsonify({"success": True})
 
 
@@ -281,12 +322,17 @@ def view_log(filename):
 
 @app.route("/api/test-connection", methods=["POST"])
 def test_connection():
-    data = request.json
-    server_ip = data.get("ip")
+    data = request.get_json(silent=True) or {}
+    server_ip = normalize_server_ip(data.get("ip"))
+    if not server_ip:
+        return jsonify({"success": False, "error": "服务器地址必须是合法IP"}), 400
+    if not any(normalize_server_ip(server.get("ip")) == server_ip for server in get_all_servers()):
+        return jsonify({"success": False, "error": "服务器未登记"}), 404
+    request_id = data.get("request_id")
 
     def run_test():
         result = deploy_service.test_connection(server_ip)
-        socketio.emit("test_result", {"ip": server_ip, "result": result})
+        socketio.emit("test_result", {"ip": server_ip, "request_id": request_id, "result": result})
 
     thread = threading.Thread(target=run_test)
     thread.start()
@@ -295,19 +341,16 @@ def test_connection():
 
 @app.route("/api/rollback", methods=["POST"])
 def rollback():
-    data = request.json
-    server_ip = data.get("server_ip")
-    jar_name = data.get("jar_name")
-
-    def run_rollback():
-        deploy_service.rollback(server_ip, jar_name)
-        socketio.emit("deploy_done", {
-            "servers": [server_ip], "jars": [jar_name],
-            "success": 1, "fail": 0,
-        })
-    thread = threading.Thread(target=run_rollback)
-    thread.start()
-    return jsonify({"success": True})
+    data = request.get_json(silent=True) or {}
+    server_ip = normalize_server_ip(data.get("server_ip"))
+    jar_name = normalize_jar_name(data.get("jar_name"))
+    if not server_ip or not is_safe_jar_name(jar_name):
+        return jsonify({"success": False, "error": "请提供有效服务器IP和JAR名称"}), 400
+    try:
+        validate_restart_items(get_all_servers(), [{"server": server_ip, "jar": jar_name}])
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+    return _start_operation("rollback", deploy_service.rollback, server_ip, jar_name)
 
 
 @app.route("/api/restart", methods=["POST"])
@@ -331,15 +374,12 @@ def restart():
     if not valid_items:
         return jsonify({"success": False, "error": "未指定重启项"}), 400
 
+    try:
+        validate_restart_items(get_all_servers(), valid_items)
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 400
 
-    def run_restart():
-        success, fail = deploy_service.restart(valid_items)
-        socketio.emit("restart_done", {"success": success, "fail": fail})
-
-    thread = threading.Thread(target=run_restart)
-    thread.start()
-
-    return jsonify({"success": True, "task_id": thread.ident})
+    return _start_operation("restart", deploy_service.restart, valid_items)
 
 
 @app.route("/api/browse-dir", methods=["POST"])

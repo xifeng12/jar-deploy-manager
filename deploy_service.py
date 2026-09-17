@@ -3,36 +3,52 @@ import json
 import re
 import socket
 import shlex
+from ipaddress import ip_address
 import paramiko
 import time
 import threading
+import uuid
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from threading import Lock, Event
 from crypto_utils import SecretEncryptionError, decrypt, encrypt, is_encrypted
-from db import get_all_servers, get_all_settings, set_settings
+from db import get_all_servers, get_all_settings, set_settings, add_deploy_history
 from runtime_paths import get_runtime_paths
 from ssh_connection import AuthConfig, ConnectionConfig, ConnectionConfigurationError, SshConnectionFactory
+from jar_names import normalize_jar_name, normalize_jar_names
 
 deploy_lock = Lock()
 deploy_cancel_flag = Event()
 current_task = None
-task_status = {}
+task_status = {"operation_id": None, "operation": None, "status": "idle", "success": 0, "fail": 0, "skip": 0}
+operation_state_lock = Lock()
 
 
-def normalize_jar_name(filename):
-    return re.sub(r"\s*\(\d+\)(?=\.jar$)", "", os.path.basename(str(filename or "")))
+def build_jar_plan(servers, selected_servers, selected_jars):
+    plan = {ip: [] for ip in selected_servers}
+    for jar_name in normalize_jar_names(selected_jars):
+        owners = {
+            server["ip"] for server in servers
+            if jar_name in {
+                normalize_jar_name(jar["name"] if isinstance(jar, dict) else jar)
+                for jar in (server.get("jars") or [])
+            }
+        }
+        if len(owners) != 1:
+            raise ValueError(f"{jar_name} 必须且只能归属一台服务器，请检查服务器配置")
+        owner = next(iter(owners))
+        if owner not in plan:
+            raise ValueError(f"{jar_name} 的所属服务器 {owner} 未选中")
+        plan[owner].append(jar_name)
+    return {ip: names for ip, names in plan.items() if names}
 
 
-def normalize_jar_names(names):
-    result = []
-    seen = set()
-    for name in names or []:
-        clean_name = normalize_jar_name(name)
-        if clean_name and clean_name not in seen:
-            result.append(clean_name)
-            seen.add(clean_name)
-    return result
+def validate_restart_items(servers, items):
+    plan = build_jar_plan(servers, [item["server"] for item in items], [item["jar"] for item in items])
+    for item in items:
+        if normalize_jar_name(item["jar"]) not in plan.get(item["server"], []):
+            raise ValueError(f"{item['jar']} 不属于服务器 {item['server']}")
 
 
 class DeployService:
@@ -56,7 +72,7 @@ class DeployService:
     def _start_log_file(self):
         logs_dir = str(get_runtime_paths().logs)
         os.makedirs(logs_dir, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filepath = os.path.join(logs_dir, f"deploy_{stamp}.log")
         with self.log_file_lock:
             self.current_log_file = filepath
@@ -229,7 +245,16 @@ class DeployService:
 
     def log(self, message, level="info"):
         self._write_log_file(message, level)
-        self.socketio.emit("log", {"message": message, "level": level})
+        try:
+            self.socketio.emit("log", {"message": message, "level": level})
+        except Exception:
+            self._write_log_file("实时日志推送失败，请查看本地日志", "warning")
+
+    def _emit_operation_event(self, event, result):
+        try:
+            self.socketio.emit(event, result)
+        except Exception:
+            self.log("操作状态推送失败，请刷新页面查询最终状态", "warning")
 
     def _migrate_passwords(self):
         changed = False
@@ -248,9 +273,25 @@ class DeployService:
         value = self.config.get(key, "")
         if not value or str(value).startswith("********"):
             return ""
-        return decrypt(value) if is_encrypted(value) else value
+        if not is_encrypted(value):
+            raise SecretEncryptionError("秘密配置未加密")
+        return decrypt(value)
+
+    def _registered_server_ip(self, server_ip):
+        try:
+            normalized = str(ip_address(str(server_ip).strip()))
+        except ValueError as error:
+            raise ConnectionConfigurationError("目标服务器地址必须是合法IP") from error
+        for server in get_all_servers():
+            try:
+                if str(ip_address(str(server.get("ip", "")).strip())) == normalized:
+                    return normalized
+            except ValueError:
+                continue
+        raise ConnectionConfigurationError("目标服务器未登记")
 
     def _connection_config(self, server_ip, fallback_password=""):
+        server_ip = self._registered_server_ip(server_ip)
         jump_host = str(self.config.get("jump_host", "")).strip()
         configured_mode = self.config.get("connection_mode", "")
         mode = configured_mode or ("jump" if jump_host else "direct")
@@ -301,7 +342,9 @@ class DeployService:
                 result["steps"][-1]["detail"] = jps_output[:300] if jps_output else "(无Java进程)"
             result["success"] = True
             result["message"] = "连接成功"
-        except (ConnectionConfigurationError, SecretEncryptionError, ValueError):
+        except SecretEncryptionError:
+            result["message"] = "凭据无法解密，请在当前 Windows 用户下重新保存密码或私钥口令"
+        except (ConnectionConfigurationError, ValueError):
             result["message"] = "连接配置无效，请检查认证方式、端口和密钥路径"
         except (socket.timeout, OSError):
             result["message"] = "连接超时，请检查IP、端口或网络"
@@ -337,30 +380,177 @@ class DeployService:
             core_name = without_ext[:dash_pos] if dash_pos > 0 else without_ext
         return f"{script_prefix}{core_name}{script_suffix}"
 
-    def deploy(self, selected_servers, selected_jars):
+    def reserve_operation(self, operation):
+        global current_task, task_status
+        with operation_state_lock:
+            if not deploy_lock.acquire(blocking=False):
+                return None
+            operation_id = uuid.uuid4().hex
+            deploy_cancel_flag.clear()
+            current_task = operation_id
+            task_status = {"operation_id": operation_id, "operation": operation, "status": "running",
+                           "success": 0, "fail": 0, "skip": 0}
+            return operation_id
+
+    def release_reservation(self, operation_id):
+        global current_task, task_status
+        with operation_state_lock:
+            if current_task == operation_id:
+                current_task = None
+                task_status = {**task_status, "status": "failed"}
+                try:
+                    self._emit_operation_event("operation_done", task_status)
+                finally:
+                    deploy_lock.release()
+
+    def get_operation_status(self):
+        with operation_state_lock:
+            return dict(task_status)
+
+    def _run_operation(self, operation, servers, jars, action, operation_id=None):
+        global current_task, task_status
+        operation_id = operation_id or self.reserve_operation(operation)
+        if not operation_id:
+            return {"success": 0, "fail": 0, "skip": 0, "status": "busy"}
+        with operation_state_lock:
+            if current_task != operation_id or task_status.get("operation") != operation:
+                raise ValueError("操作预留已失效")
+        started = time.monotonic()
+        result = {"success": 0, "fail": len(jars), "skip": 0, "status": "failed"}
+        try:
+            self._start_log_file()
+            self.log(f"[操作] {operation_id} {operation}: {servers} / {jars}")
+            self._emit_operation_event("operation_started", self.get_operation_status())
+            result = action()
+            if deploy_cancel_flag.is_set():
+                result["status"] = "cancelled"
+            elif result.get("fail") or result.get("skip"):
+                result["status"] = "failed"
+        except Exception as error:
+            self.log(f"[错误] {operation} 未完成: {error}", "error")
+            result["error"] = str(error)
+        finally:
+            result.update(operation_id=operation_id, operation=operation)
+            try:
+                add_deploy_history(servers, jars, result["success"], result["fail"], result["skip"],
+                                   round(time.monotonic() - started), f"{operation}:{result['status']}")
+            except Exception as error:
+                result["audit_error"] = "历史记录保存失败，请保留日志"
+                self.log(f"[审计错误] 历史记录未保存: {error}", "error")
+            self.log(f"[系统] 日志已保存: {self.current_log_file}")
+            self._stop_log_file()
+            with operation_state_lock:
+                task_status = dict(result)
+                current_task = None
+                # Emit before releasing so an older completion cannot follow a new start.
+                try:
+                    self._emit_operation_event("operation_done", result)
+                finally:
+                    deploy_lock.release()
+        return result
+
+    def deploy(self, selected_servers, selected_jars, operation_id=None):
+        return self._run_operation("deploy", selected_servers, selected_jars,
+                                   lambda: self._deploy(selected_servers, selected_jars), operation_id)
+
+    def restart(self, items, operation_id=None):
+        return self._run_operation("restart", list(dict.fromkeys(i["server"] for i in items)),
+                                   [i["jar"] for i in items], lambda: self._restart(items), operation_id)
+
+    def rollback(self, server_ip, jar_name, operation_id=None):
+        return self._run_operation("rollback", [server_ip], [jar_name],
+                                   lambda: self._rollback(server_ip, jar_name), operation_id)
+
+    def _checked_command(self, ssh, command):
+        _, stdout, stderr = ssh.exec_command(command, timeout=120)
+        output = stdout.read().decode("utf-8", errors="replace").strip()
+        error = stderr.read().decode("utf-8", errors="replace").strip()
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            raise RuntimeError(f"远程命令失败（退出码 {exit_code}）: {error[:500]}")
+        return output
+
+    def _jar_pids(self, ssh, jar_name):
+        output = self._checked_command(ssh, "source /etc/profile && jps -l")
+        return {parts[0] for line in output.splitlines() if len(parts := line.split()) >= 2
+                and parts[0].isdigit() and os.path.basename(parts[1]) == jar_name}
+
+    def _restart_verified(self, ssh, jar_name, remote_script, start_wait):
+        old_pids = self._jar_pids(ssh, jar_name)
+        self._checked_command(ssh, f"source /etc/profile && {shlex.quote(remote_script)} restart")
+        time.sleep(start_wait)
+        for attempt in range(3):
+            new_pids = self._jar_pids(ssh, jar_name)
+            if new_pids and not (new_pids & old_pids):
+                for pid in new_pids:
+                    self._checked_command(ssh, f"kill -0 {pid}")
+                return
+            if attempt < 2:
+                time.sleep(5)
+        raise RuntimeError("重启后未检测到新的存活 JAR 进程，不能确认启动成功")
+
+    def _restore_backup(self, ssh, backup, remote_jar):
+        temporary = f"{remote_jar}.restore-{uuid.uuid4().hex}"
+        try:
+            self._checked_command(ssh, f"cp -p -- {shlex.quote(backup)} {shlex.quote(temporary)} && "
+                                  f"cmp -s -- {shlex.quote(backup)} {shlex.quote(temporary)} && "
+                                  f"mv -f -- {shlex.quote(temporary)} {shlex.quote(remote_jar)}")
+        finally:
+            self._checked_command(ssh, f"rm -f -- {shlex.quote(temporary)}")
+
+    def _deploy_one(self, ssh, task, start_wait):
+        remote = task["remote_jar"]
+        temporary = f"{remote}.upload-{uuid.uuid4().hex}"
+        replaced = False
+        sftp = ssh.open_sftp()
+        try:
+            if not task["script_exists"]:
+                raise RuntimeError("启动脚本不存在，未上传或替换 JAR")
+            if task["jar_exists"] and not task["backup_file"]:
+                raise RuntimeError("备份未确认，禁止替换 JAR")
+            sftp.put(task["local_jar"], temporary)
+            if sftp.stat(temporary).st_size != os.path.getsize(task["local_jar"]):
+                raise RuntimeError("临时 JAR 上传大小不符，未替换旧文件")
+            if task["jar_exists"]:
+                sftp.chmod(temporary, sftp.stat(remote).st_mode & 0o777)
+            replaced = True
+            sftp.posix_rename(temporary, remote)
+            self._restart_verified(ssh, task["jar_name"], task["remote_script"], start_wait)
+        except Exception:
+            if replaced and task["backup_file"]:
+                try:
+                    self._restore_backup(ssh, task["backup_file"], remote)
+                    self._restart_verified(ssh, task["jar_name"], task["remote_script"], start_wait)
+                    self.log(f"[恢复] {task['jar_name']} 已恢复旧文件并验证启动；备份保留", "warning")
+                except Exception as recovery_error:
+                    self.log(f"[恢复失败] {task['jar_name']}: {recovery_error}；请手工检查，备份: {task['backup_file']}", "error")
+            elif replaced:
+                self.log(f"[恢复] {task['jar_name']} 无旧版本备份，新文件仍在远端，请手动检查", "error")
+            raise
+        finally:
+            try:
+                sftp.remove(temporary)
+            except OSError:
+                pass
+            sftp.close()
+
+    def _deploy(self, selected_servers, selected_jars):
         global current_task, task_status, deploy_cancel_flag
 
         selected_jars = normalize_jar_names(selected_jars)
-        deploy_cancel_flag.clear()
-        if not deploy_lock.acquire(blocking=False):
-            self.log("⚠️  已有部署任务进行中，请稍后再试", "warning")
-            return {"success": 0, "fail": 0, "skip": 0, "status": "busy"}
-        log_file = self._start_log_file()
-
-        current_task = "deploying"
-        task_status = {
-            "status": "deploying",
+        log_file = self.current_log_file
+        task_status.update({
             "progress": 0,
             "success_count": 0,
             "fail_count": 0,
             "skip_count": 0,
-        }
+        })
 
         completed = 0
         success_count = 0
         fail_count = 0
         skip_count = 0
-        total_tasks = max(len(selected_servers) * len(selected_jars), 1)
+        total_tasks = max(len(selected_jars), 1)
         status_lock = Lock()
 
         def update_totals(result):
@@ -375,7 +565,7 @@ class DeployService:
                 task_status["fail_count"] = fail_count
                 task_status["skip_count"] = skip_count
 
-        def deploy_server(server_ip, srv_jar_map, jar_dir, script_dir, backup_dir,
+        def deploy_server(server_ip, server_jars, jar_dir, script_dir, backup_dir,
                           deploy_interval, start_wait, jars_dir):
             result = {"success": 0, "fail": 0, "skip": 0, "completed": 0}
             prefix = f"[{server_ip}]"
@@ -384,26 +574,21 @@ class DeployService:
             jar_tasks = []
 
             if deploy_cancel_flag.is_set():
-                result["skip"] = len(selected_jars)
-                result["completed"] = len(selected_jars)
+                result["skip"] = len(server_jars)
+                result["completed"] = len(server_jars)
                 return result
 
             try:
                 self.log(f"\n{'═' * 50}")
-                self.log(f"{prefix} 🖥️ 服务器队列开始，共 {len(selected_jars)} 个JAR")
+                self.log(f"{prefix} 🖥️ 服务器队列开始，共 {len(server_jars)} 个JAR")
                 connection = self.open_ssh_connection(server_ip)
                 ssh = connection.client
 
-                for jar_name in selected_jars:
+                for jar_name in server_jars:
                     local_jar = os.path.join(jars_dir, jar_name)
                     if not os.path.exists(local_jar):
                         self.log(f"{prefix} ❌ 本地JAR包不存在: {jar_name}", "error")
                         result["fail"] += 1
-                        result["completed"] += 1
-                        continue
-                    if jar_name not in srv_jar_map.get(server_ip, set()):
-                        self.log(f"{prefix} ⊘ {jar_name} 未关联到该服务器，跳过", "warning")
-                        result["skip"] += 1
                         result["completed"] += 1
                         continue
                     script_name = self._find_jar_script(jar_name)
@@ -424,15 +609,18 @@ class DeployService:
                 self.log(f"{prefix} [预检] 检查远程文件状态...")
                 dir_missing = False
                 for task in jar_tasks:
+                    q_script = shlex.quote(task["remote_script"])
+                    q_jar = shlex.quote(task["remote_jar"])
+                    q_dir = shlex.quote(os.path.dirname(task["remote_jar"]))
                     stdin, stdout, stderr = ssh.exec_command(
-                        f"echo 'script_{task['jar_name']}:'$(test -f {task['remote_script']} && echo 'exists' || echo 'missing');"
-                        f"echo 'jar_{task['jar_name']}:'$(test -f {task['remote_jar']} && echo 'exists' || echo 'missing');"
-                        f"echo 'dir_{os.path.dirname(task['remote_jar'])}:'$(test -d {os.path.dirname(task['remote_jar'])} && echo 'exists' || echo 'missing')"
+                        f"printf 'script:'; test -f {q_script} && echo 'exists' || echo 'missing';"
+                        f"printf 'jar:'; test -f {q_jar} && echo 'exists' || echo 'missing';"
+                        f"printf 'dir:'; test -d {q_dir} && echo 'exists' || echo 'missing'"
                     )
                     out = stdout.read().decode().strip()
-                    task["script_exists"] = f"script_{task['jar_name']}:exists" in out
-                    task["jar_exists"] = f"jar_{task['jar_name']}:exists" in out
-                    task["dir_exists"] = f"dir_{os.path.dirname(task['remote_jar'])}:exists" in out
+                    task["script_exists"] = "script:exists" in out
+                    task["jar_exists"] = "jar:exists" in out
+                    task["dir_exists"] = "dir:exists" in out
                     if not task["script_exists"]:
                         self.log(f"{prefix}   ⚠️ {task['script_name']} 不存在", "warning")
                     if not task["jar_exists"]:
@@ -455,17 +643,12 @@ class DeployService:
                         jar_name = task["jar_name"]
                         remote_jar = task["remote_jar"]
                         q_remote = shlex.quote(remote_jar)
-                        q_backup = shlex.quote(backup_dir)
-                        q_jar = shlex.quote(jar_name)
-                        stdin, stdout, stderr = ssh.exec_command(
-                            f"mkdir -p {q_backup} && "
-                            f"mod_time=$(stat -c %Y {q_remote} 2>/dev/null || stat -f %m {q_remote} 2>/dev/null || date +%s) && "
-                            f"orig_date=$(date -d @$mod_time +%Y%m%d%H%M%S 2>/dev/null || date -r $mod_time +%Y%m%d%H%M%S 2>/dev/null || date +%Y%m%d%H%M%S) && "
-                            f"deploy_date=$(date +%Y%m%d%H%M%S) && "
-                            f"cp {q_remote} {q_backup}/{q_jar}.原${{orig_date}}_${{deploy_date}} && "
-                            f"ls -t {q_backup}/{q_jar}.原* 2>/dev/null | head -1"
-                        )
-                        task["backup_file"] = stdout.read().decode().strip()
+                        backup_file = f"{backup_dir}/{jar_name}.原{datetime.now():%Y%m%d%H%M%S}_{uuid.uuid4().hex}"
+                        self._checked_command(ssh,
+                            f"mkdir -p -- {shlex.quote(backup_dir)} && "
+                            f"cp -p -- {q_remote} {shlex.quote(backup_file)} && "
+                            f"cmp -s -- {q_remote} {shlex.quote(backup_file)}")
+                        task["backup_file"] = backup_file
                         self.log(f"{prefix}   ✓ {jar_name} → {task['backup_file']}")
                     else:
                         self.log(f"{prefix}   ⊘ {task['jar_name']} 远程不存在，跳过备份", "warning")
@@ -483,73 +666,12 @@ class DeployService:
 
                     jar_name = task["jar_name"]
                     self.log(f"{prefix} [{jar_name}] [上传] 正在上传JAR包...")
-                    sftp = ssh.open_sftp()
                     try:
-                        sftp.put(task["local_jar"], task["remote_jar"])
-                    finally:
-                        sftp.close()
-                    self.log(f"{prefix} [{jar_name}] [上传] 上传完成")
-
-                    if task["script_exists"]:
-                        self.log(f"{prefix} [{jar_name}] [启动] 正在重启服务...")
-                        stdin, stdout, stderr = ssh.exec_command(
-                            f"source /etc/profile && {task['remote_script']} restart"
-                        )
-                        exit_code = stdout.channel.recv_exit_status()
-                        err = stderr.read().decode().strip()
-                        if exit_code != 0:
-                            self.log(f"{prefix} [{jar_name}] ⚠️ {task['script_name']} restart 退出码={exit_code}", "warning")
-                            if err:
-                                self.log(f"{prefix} [{jar_name}] {err}", "warning")
-                    else:
-                        self.log(f"{prefix} [{jar_name}] ⚠️ 脚本缺失，请手动启动", "warning")
-                        result["skip"] += 1
-                        result["completed"] += 1
-                        continue
-
-                    self.log(f"{prefix} [{jar_name}] [检查] 等待服务启动（{start_wait}秒）...")
-                    time.sleep(start_wait)
-                    matched_line = ""
-                    max_retries = 2
-                    for retry in range(max_retries + 1):
-                        stdin, stdout, stderr = ssh.exec_command("source /etc/profile && jps")
-                        all_jps = stdout.read().decode().strip()
-                        for line in all_jps.split("\n"):
-                            if jar_name in line:
-                                matched_line = line
-                                break
-                        if matched_line:
-                            pid = matched_line.split()[0]
-                            stdin2, stdout2, stderr2 = ssh.exec_command(
-                                f"kill -0 {pid} 2>/dev/null && echo alive || echo dead"
-                            )
-                            alive = stdout2.read().decode().strip()
-                            if alive == "alive":
-                                self.log(f"{prefix} [{jar_name}] ✅ 启动成功 (PID={pid})")
-                                result["success"] += 1
-                                break
-                            matched_line = ""
-                        if retry < max_retries:
-                            self.log(f"{prefix} [{jar_name}] [检查] 未启动，5秒后重试...")
-                            time.sleep(5)
-
-                    if not matched_line:
-                        self.log(f"{prefix} [{jar_name}] ❌ 启动失败", "error")
-                        if task["backup_file"] and task["backup_file"] != "null":
-                            ssh.exec_command(f"rm -f {shlex.quote(task['remote_jar'])}")
-                            _, mv_out, _ = ssh.exec_command(
-                                f"mv {shlex.quote(task['backup_file'])} {shlex.quote(task['remote_jar'])}"
-                            )
-                            mv_out.channel.recv_exit_status()
-                            ssh.exec_command(f"source /etc/profile && {shlex.quote(task['remote_script'])} restart")
-                            time.sleep(start_wait)
-                            stdin, stdout, stderr = ssh.exec_command("source /etc/profile && jps")
-                            all_jps = stdout.read().decode().strip()
-                            rollback_ok = any(jar_name in line for line in all_jps.split("\n"))
-                            if rollback_ok:
-                                self.log(f"{prefix} [{jar_name}] ↩ 回滚成功", "warning")
-                            else:
-                                self.log(f"{prefix} [{jar_name}] ❌ 回滚失败", "error")
+                        self._deploy_one(ssh, task, start_wait)
+                        self.log(f"{prefix} [{jar_name}] ✅ 新版本启动成功")
+                        result["success"] += 1
+                    except Exception as error:
+                        self.log(f"{prefix} [{jar_name}] ❌ 部署失败: {error}", "error")
                         result["fail"] += 1
 
                     result["completed"] += 1
@@ -561,7 +683,7 @@ class DeployService:
 
             except Exception as e:
                 self.log(f"{prefix} [❌ 错误] {str(e)}", "error")
-                remaining = max(len(selected_jars) - result["completed"], 0)
+                remaining = max(len(server_jars) - result["completed"], 0)
                 result["fail"] += remaining
                 result["completed"] += remaining
                 return result
@@ -572,6 +694,10 @@ class DeployService:
         try:
             self.load_config()
             all_servers = get_all_servers()
+            plan = build_jar_plan(all_servers, selected_servers, selected_jars)
+            if not plan:
+                raise ValueError("请选择已关联服务器的JAR包")
+            selected_servers = list(plan)
 
             jars_dir = str(get_runtime_paths().jars)
             missing_jars = [
@@ -588,13 +714,6 @@ class DeployService:
             deploy_interval = int(self.config.get("deploy_interval", 30))
             start_wait = int(self.config.get("start_wait", 10))
 
-            srv_jar_map = {}
-            for s in all_servers:
-                srv_jar_map[s["ip"]] = set(
-                    normalize_jar_name(j["name"] if isinstance(j, dict) else j)
-                    for j in (s.get("jars") or [])
-                )
-
             worker_count = max(len(selected_servers), 1)
             self.log("=" * 50)
             self.log("🚀 开始并发部署")
@@ -610,7 +729,7 @@ class DeployService:
                 futures = {
                     executor.submit(
                         deploy_server,
-                        server_ip, srv_jar_map, jar_dir,
+                        server_ip, plan[server_ip], jar_dir,
                         script_dir, backup_dir, deploy_interval, start_wait, jars_dir,
                     ): server_ip
                     for server_ip in selected_servers
@@ -640,115 +759,44 @@ class DeployService:
         except Exception as e:
             self.log(f"[❌ 系统错误] {str(e)}", "error")
             return {"success": success_count, "fail": fail_count + 1, "skip": skip_count, "status": "failed"}
-        finally:
-            if self.current_log_file:
-                self.log(f"[系统] 日志已保存: {self.current_log_file}")
-            self._stop_log_file()
-            if deploy_lock.locked():
-                deploy_lock.release()
-            current_task = None
-            task_status = {
-                "status": "done",
-                "progress": 100,
-                "success_count": success_count,
-                "fail_count": fail_count,
-                "skip_count": skip_count,
-            }
+
 
     def cancel_deploy(self):
-        deploy_cancel_flag.set()
-        self.log("⏹️ 用户请求停止部署", "warning")
+        with operation_state_lock:
+            if current_task:
+                deploy_cancel_flag.set()
+        self.log("⏹️ 用户请求停止；当前单项将完成或恢复后退出", "warning")
 
     def is_deploying(self):
-        return current_task == "deploying"
+        return deploy_lock.locked()
 
-    def restart(self, servers_jars):
-        self.log("🔄 开始重启服务...")
-
-        script_dir_cfg = self.config.get("script_dir", "/home/app/shell/")
+    def _restart(self, servers_jars):
+        validate_restart_items(get_all_servers(), servers_jars)
+        result = {"success": 0, "fail": 0, "skip": 0, "status": "done"}
+        script_dir = self.config.get("script_dir", "/opt/app/scripts")
         start_wait = int(self.config.get("start_wait", 10))
         deploy_interval = int(self.config.get("deploy_interval", 30))
-
-        success_count = 0
-        fail_count = 0
-
-        for item in servers_jars:
-            server_ip = item["server"]
-            jar_name = item["jar"]
-
-            self.log(f"\n{'─' * 40}")
-            self.log(f"🔄 重启 {server_ip}:{jar_name}")
-
+        for index, item in enumerate(servers_jars):
+            if deploy_cancel_flag.is_set():
+                result["skip"] += len(servers_jars) - index
+                break
+            jar_name = normalize_jar_name(item["jar"])
             connection = None
-
             try:
-                connection = self.open_ssh_connection(server_ip)
-                ssh = connection.client
-
-                script_name = self._find_jar_script(jar_name)
-                remote_script = f"{script_dir_cfg.rstrip('/')}/{script_name}"
-                self.log(f"[重启] 脚本: {remote_script}")
-
-                self.log("[重启] 正在重启服务...")
-                stdin, stdout, stderr = ssh.exec_command(
-                    f"source /etc/profile && {remote_script} restart"
-                )
-                exit_code = stdout.channel.recv_exit_status()
-                err = stderr.read().decode().strip()
-                if exit_code != 0:
-                    self.log(f"[重启] ⚠️ 退出码={exit_code}", "warning")
-                    if err:
-                        self.log(f"[重启] {err}", "warning")
-                else:
-                    self.log("[重启] ✓ restart 命令已执行")
-
-                self.log(f"[检查] 等待服务启动（{start_wait}秒）...")
-                time.sleep(start_wait)
-
-                stdin, stdout, stderr = ssh.exec_command("source /etc/profile && jps")
-                all_jps = stdout.read().decode().strip()
-                matched_line = ""
-                for line in all_jps.split("\n"):
-                    if jar_name in line:
-                        matched_line = line
-                        break
-
-                if matched_line:
-                    pid = matched_line.split()[0]
-                    stdin2, stdout2, stderr2 = ssh.exec_command(
-                        f"kill -0 {pid} 2>/dev/null && echo alive || echo dead"
-                    )
-                    alive = stdout2.read().decode().strip()
-                    if alive == "alive":
-                        self.log(f"[✅ 成功] {jar_name} 重启完成 (PID={pid})", "success")
-                        success_count += 1
-                    else:
-                        self.log(f"[❌ 失败] {jar_name} 进程 {pid} 已退出", "error")
-                        self.log(f"[调试] jps输出:\n{all_jps}", "warning")
-                        fail_count += 1
-                else:
-                    self.log(f"[❌ 失败] {jar_name} 重启后未检测到进程", "error")
-                    self.log(f"[调试] jps输出:\n{all_jps}", "warning")
-                    fail_count += 1
-
-            except Exception as e:
-                self.log(f"[❌ 错误] {server_ip}: {str(e)}", "error")
-                fail_count += 1
+                connection = self.open_ssh_connection(item["server"])
+                script = f"{script_dir.rstrip('/')}/{self._find_jar_script(jar_name)}"
+                self._restart_verified(connection.client, jar_name, script, start_wait)
+                self.log(f"[✅ 成功] {jar_name} 重启完成", "success")
+                result["success"] += 1
+            except Exception as error:
+                self.log(f"[❌ 错误] {item['server']}:{jar_name}: {error}", "error")
+                result["fail"] += 1
             finally:
                 if connection:
                     connection.close()
-
-            if item != servers_jars[-1]:
-                self.log(f"[等待] {deploy_interval}秒后继续...")
-                time.sleep(deploy_interval)
-
-        self.log("\n" + "=" * 50)
-        self.log("📊 重启完成")
-        self.log(f"✅ 成功: {success_count} 个")
-        self.log(f"❌ 失败: {fail_count} 个")
-        self.log("=" * 50)
-
-        return success_count, fail_count
+            if index < len(servers_jars) - 1 and deploy_interval > 0:
+                deploy_cancel_flag.wait(deploy_interval)
+        return result
 
     def discover_jars(self, server_ip):
         result = {"success": False, "jars": [], "error": ""}
@@ -764,9 +812,11 @@ class DeployService:
             script_prefix = self.config.get("script_prefix", "shell-")
             script_suffix = self.config.get("script_suffix", ".sh")
             log_dir = self.config.get("log_dir", "/home/app/applog/")
-            cmd = (f"echo '---JARS---' && ls {jar_dir}/*.jar 2>/dev/null; "
-                   f"echo '---SCRIPTS---' && ls {script_dir}/{script_prefix}*{script_suffix} 2>/dev/null; "
-                   f"echo '---LOGDIRS---' && ls -d {log_dir}/*/ 2>/dev/null | xargs -n1 basename; true")
+            cmd = (
+                f"echo '---JARS---'; for f in {shlex.quote(jar_dir)}/*.jar; do [ -f \"$f\" ] && basename \"$f\"; done; "
+                f"echo '---SCRIPTS---'; for f in {shlex.quote(script_dir)}/{shlex.quote(script_prefix)}*{shlex.quote(script_suffix)}; do [ -f \"$f\" ] && basename \"$f\"; done; "
+                f"echo '---LOGDIRS---'; for d in {shlex.quote(log_dir)}/*/; do [ -d \"$d\" ] && basename \"$d\"; done; true"
+            )
             stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
             out = stdout.read().decode().strip()
 
@@ -812,54 +862,33 @@ class DeployService:
 
         return result
 
-    def rollback(self, server_ip, jar_name):
-        self.log(f"\n🔄 手动回滚: {server_ip}:{jar_name}")
-
-        connection = None
-
+    def _rollback(self, server_ip, jar_name):
+        jar_name = normalize_jar_name(jar_name)
+        validate_restart_items(get_all_servers(), [{"server": server_ip, "jar": jar_name}])
+        self.log(f"手动回滚: {server_ip}:{jar_name}")
+        connection = self.open_ssh_connection(server_ip)
         try:
-            connection = self.open_ssh_connection(server_ip)
             ssh = connection.client
-
             jar_dir = self.config.get("jar_dir", "/opt/app/jars")
             script_dir = self.config.get("script_dir", "/opt/app/scripts")
             backup_dir = self.config.get("backup_dir", "/opt/app/backup")
-
-            script_name = self._find_jar_script(jar_name)
             remote_jar = f"{jar_dir}/{jar_name}"
-            remote_script = f"{script_dir.rstrip('/')}/{script_name}"
-
-            stdin, stdout, stderr = ssh.exec_command(
-                f"latest=$(ls -t {shlex.quote(backup_dir)}/{shlex.quote(jar_name)}.原* 2>/dev/null | head -1); "
-                f"[ -z \"$latest\" ] && latest=$(ls -t {shlex.quote(backup_dir)}/{shlex.quote(jar_name)}.* 2>/dev/null | head -1); "
-                f"echo \"$latest\""
-            )
-            latest_backup = stdout.read().decode().strip()
-
-            if latest_backup:
-                ssh.exec_command(f"rm -f {shlex.quote(remote_jar)}")
-                _, mv_out, _ = ssh.exec_command(
-                    f"mv {shlex.quote(latest_backup)} {shlex.quote(remote_jar)}"
-                )
-                mv_out.channel.recv_exit_status()
-                ssh.exec_command(f"source /etc/profile && {shlex.quote(remote_script)} restart")
-                start_wait = int(self.config.get("start_wait", 10))
-                time.sleep(start_wait)
-                stdin, stdout, stderr = ssh.exec_command("source /etc/profile && jps")
-                all_jps = stdout.read().decode().strip()
-                rollback_ok = any(jar_name in line for line in all_jps.split("\n"))
-                if rollback_ok:
-                    self.log("[✅] 回滚成功", "success")
-                else:
-                    self.log("[❌] 回滚失败，服务未启动", "error")
-            else:
-                self.log("[❌] 未找到备份文件", "error")
-
-        except Exception as e:
-            self.log(f"[❌] 回滚失败: {str(e)}", "error")
+            remote_script = f"{script_dir.rstrip('/')}/{self._find_jar_script(jar_name)}"
+            candidates = self._checked_command(ssh,
+                f"find {shlex.quote(backup_dir)} -maxdepth 1 -type f "
+                f"-name {shlex.quote(jar_name + '.*')} -printf '%T@ %p\\n' | sort -nr")
+            backups = [line.split(" ", 1)[1] for line in candidates.splitlines() if " " in line]
+            if not backups:
+                raise RuntimeError("未找到备份文件，未修改远端 JAR")
+            backup = backups[0]
+            if os.path.dirname(backup) != backup_dir.rstrip("/") or not os.path.basename(backup).startswith(jar_name + "."):
+                raise RuntimeError("备份路径与目标 JAR 不匹配")
+            self._restore_backup(ssh, backup, remote_jar)
+            self._restart_verified(ssh, jar_name, remote_script, int(self.config.get("start_wait", 10)))
+            self.log("[✅] 回滚成功；备份文件保留", "success")
+            return {"success": 1, "fail": 0, "skip": 0, "status": "done"}
         finally:
-            if connection:
-                connection.close()
+            connection.close()
 
     def list_log_files(self, server_ip, jar_name):
         result = {"success": False, "files": [], "error": ""}
@@ -874,7 +903,7 @@ class DeployService:
         try:
             connection = self.open_ssh_connection(server_ip)
             ssh = connection.client
-            cmd = (f"find {log_path} -type f \\( -name '*.log' -o -name '*.log.gz' \\) -newermt '{today} 00:00:00' ! -newermt '{today} 23:59:59' -exec stat -c '%Y|%s|%n' {{}} \\; 2>/dev/null | sort -t'|' -k3")
+            cmd = (f"find {shlex.quote(log_path)} -type f \\( -name '*.log' -o -name '*.log.gz' \\) -newermt '{today} 00:00:00' ! -newermt '{today} 23:59:59' -exec stat -c '%Y|%s|%n' {{}} \\; 2>/dev/null | sort -t'|' -k3")
             stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
             out = stdout.read().decode().strip()
             result["success"] = True
@@ -976,11 +1005,22 @@ class ScheduleTaskManager:
         return []
 
     def _save_tasks(self, tasks):
-        with open(self.tasks_file, "w", encoding="utf-8") as f:
-            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        directory = os.path.dirname(os.path.abspath(self.tasks_file))
+        os.makedirs(directory, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".scheduled-", suffix=".tmp")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                json.dump(tasks, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.tasks_file)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def get_all(self):
-        return self._load_tasks()
+        with self._lock:
+            return self._load_tasks()
 
     def create_task(self, servers, jars, scheduled_at, name="", task_type="deploy"):
         if task_type not in ("deploy", "restart"):
@@ -990,6 +1030,10 @@ class ScheduleTaskManager:
             return {"success": False, "error": "请选择目标服务器"}
         if not jars:
             return {"success": False, "error": "请选择JAR包"}
+        try:
+            servers = list(build_jar_plan(get_all_servers(), servers, jars))
+        except ValueError as error:
+            return {"success": False, "error": str(error)}
 
         if len(scheduled_at) == 16:
             scheduled_at += ":00"
@@ -1002,7 +1046,7 @@ class ScheduleTaskManager:
         if scheduled_dt <= now:
             return {"success": False, "error": "预定时间必须晚于当前时间"}
 
-        task_id = str(int(time.time() * 1000))
+        task_id = uuid.uuid4().hex
         task = {
             "id": task_id,
             "name": name or f"任务-{task_id[-6:]}",
@@ -1046,6 +1090,8 @@ class ScheduleTaskManager:
             tasks = self._load_tasks()
             for i, t in enumerate(tasks):
                 if t["id"] == task_id:
+                    if t["status"] == "running":
+                        return {"success": False, "error": "运行中任务不能删除，请先等待结束"}
                     if t["status"] == "pending" and task_id in self.timers:
                         self.timers[task_id].cancel()
                         del self.timers[task_id]
@@ -1076,49 +1122,27 @@ class ScheduleTaskManager:
             "id": task_id, "name": task["name"]
         })
 
-        waited = 0
-        while not deploy_lock.acquire(blocking=False):
-            time.sleep(10)
-            waited += 10
-            if waited > 300:
-                with self._lock:
-                    tasks = self._load_tasks()
-                    for t in tasks:
-                        if t["id"] == task_id:
-                            t["status"] = "failed"
-                            t["error"] = "等待部署锁超时（5分钟）"
-                    self._save_tasks(tasks)
-                self.socketio.emit("scheduled_task_done", {
-                    "id": task_id, "status": "failed",
-                    "error": "等待超时"
-                })
-                return
-        deploy_lock.release()
-
         try:
-            self.deploy_service.load_config()
-            if task["type"] == "deploy":
-                deploy_result = self.deploy_service.deploy(task["servers"], task["jars"]) or {}
-                success_count = deploy_result.get("success", 0)
-                fail_count = deploy_result.get("fail", 0)
-                skip_count = deploy_result.get("skip", 0)
-                if success_count == 0 and fail_count == 0:
-                    status = "failed"
-                    result = None
-                    error = "部署未执行（JAR包缺失或配置错误，请查看日志）"
+            result = {"status": "busy"}
+            deadline = time.monotonic() + 300
+            while result.get("status") == "busy":
+                if task["type"] == "deploy":
+                    result = self.deploy_service.deploy(task["servers"], task["jars"])
                 else:
-                    status = "completed" if fail_count == 0 else "failed"
-                    result = {"success": success_count, "fail": fail_count, "skip": skip_count}
-                    error = None if fail_count == 0 else f"{fail_count} 个失败"
+                    plan = build_jar_plan(get_all_servers(), task["servers"], task["jars"])
+                    items = [{"server": ip, "jar": jar} for ip, jars in plan.items() for jar in jars]
+                    result = self.deploy_service.restart(items)
+                if result.get("status") != "busy":
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("等待操作锁超时（5分钟）")
+                time.sleep(10)
+            if result.get("status") == "cancelled":
+                status, error = "cancelled", "任务已取消；请查看已完成和跳过的数量"
+            elif result.get("status") == "done" and result.get("success", 0) > 0 and not result.get("fail") and not result.get("skip"):
+                status, error = "completed", None
             else:
-                items = []
-                for s in task["servers"]:
-                    for j in task["jars"]:
-                        items.append({"server": s, "jar": j})
-                success_count, fail_count = self.deploy_service.restart(items)
-                status = "completed" if fail_count == 0 else "failed"
-                result = {"success": success_count, "fail": fail_count}
-                error = None if fail_count == 0 else f"{fail_count} 个失败"
+                status, error = "failed", result.get("error") or "任务未全部完成，请查看日志"
 
         except Exception as e:
             status = "failed"
@@ -1143,10 +1167,18 @@ class ScheduleTaskManager:
         })
 
     def recover(self):
+        with self._lock:
+            return self._recover()
+
+    def _recover(self):
         tasks = self._load_tasks()
         now = datetime.now()
         recovered = 0
         for task in tasks:
+            if task["status"] == "running":
+                task["status"] = "interrupted"
+                task["error"] = "进程曾中断，远端状态未知；请人工检查后新建任务，不自动重放"
+                continue
             if task["status"] != "pending":
                 continue
             try:

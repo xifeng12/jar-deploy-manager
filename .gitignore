@@ -12,3 +12,11 @@ release/
 __pycache__/
 .pytest_cache/
 frontend/.ctx-plan-dist/
+scheduled_tasks.json
+node_modules/
+output/
+.omo/
+.debug-journal.md
+release-staging/
+github-candidate-*/
+github-release-*/
