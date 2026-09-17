@@ -1,11 +1,52 @@
+import os
+import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 import paramiko
 from paramiko import SSHException
 
 from runtime_paths import get_runtime_paths
+
+
+_host_keys_lock = Lock()
+
+
+def _save_host_keys_atomic(known_hosts: Path, keys: paramiko.HostKeys):
+    descriptor, filename = tempfile.mkstemp(prefix=f".{known_hosts.name}-", dir=known_hosts.parent)
+    temporary_path = Path(filename)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            for hostname, host_keys in keys.items():
+                for key_type, key in host_keys.items():
+                    stream.write(f"{hostname} {key_type} {key.get_base64()}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, known_hosts)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+class _AcceptNewHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    def __init__(self, known_hosts: Path):
+        self.known_hosts = known_hosts
+
+    def missing_host_key(self, client, hostname, key):
+        with _host_keys_lock:
+            keys = paramiko.HostKeys()
+            if self.known_hosts.exists():
+                keys.load(str(self.known_hosts))
+            existing = keys.lookup(hostname)
+            if existing:
+                expected = existing.get(key.get_name()) or next(iter(existing.values()))
+                if expected != key:
+                    raise paramiko.BadHostKeyException(hostname, key, expected)
+            else:
+                keys.add(hostname, key.get_name(), key)
+                _save_host_keys_atomic(self.known_hosts, keys)
+            client.get_host_keys().add(hostname, key.get_name(), key)
 
 
 class ConnectionConfigurationError(ValueError):
@@ -104,9 +145,10 @@ class SshConnectionFactory:
         client = paramiko.SSHClient()
         try:
             client.load_system_host_keys()
-            if known_hosts.exists():
-                client.load_host_keys(str(known_hosts))
-            client.set_missing_host_key_policy(self._host_key_policy())
+            with _host_keys_lock:
+                if known_hosts.exists():
+                    client.load_host_keys(str(known_hosts))
+            client.set_missing_host_key_policy(self._host_key_policy(known_hosts))
             client.connect(
                 hostname=host,
                 port=port,
@@ -117,8 +159,6 @@ class SshConnectionFactory:
                 **self._auth_kwargs(auth),
                 **({"sock": sock} if sock is not None else {}),
             )
-            if self.config.host_key_policy == "accept-new":
-                client.save_host_keys(str(known_hosts))
         except (ConnectionConfigurationError, OSError, RuntimeError, SSHException):
             client.close()
             raise
@@ -142,9 +182,9 @@ class SshConnectionFactory:
         known_hosts.parent.mkdir(parents=True, exist_ok=True)
         return known_hosts
 
-    def _host_key_policy(self):
+    def _host_key_policy(self, known_hosts: Path):
         if self.config.host_key_policy == "accept-new":
-            return paramiko.AutoAddPolicy()
+            return _AcceptNewHostKeyPolicy(known_hosts)
         if self.config.host_key_policy == "strict":
             return paramiko.RejectPolicy()
         raise ConnectionConfigurationError("host_key_policy must be accept-new or strict")

@@ -22,7 +22,10 @@ def encrypt(plaintext):
     if not plaintext:
         return ""
     if is_windows():
-        return "dpapi:" + base64.b64encode(_protect(plaintext.encode("utf-8"))).decode("ascii")
+        try:
+            return "dpapi:" + base64.b64encode(_protect(plaintext.encode("utf-8"))).decode("ascii")
+        except (OSError, ValueError):
+            raise SecretEncryptionError("secret cannot be encrypted for this Windows user") from None
     return "fernet:" + _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
 
 
@@ -32,7 +35,11 @@ def decrypt(ciphertext):
     if ciphertext.startswith("dpapi:"):
         if not is_windows():
             raise SecretEncryptionError("DPAPI secrets can only be decrypted on Windows")
-        return _unprotect(base64.b64decode(ciphertext.removeprefix("dpapi:"))).decode("utf-8")
+        try:
+            value = base64.b64decode(ciphertext.removeprefix("dpapi:"), validate=True)
+            return _unprotect(value).decode("utf-8")
+        except (OSError, ValueError):
+            raise SecretEncryptionError("secret cannot be decrypted for this Windows user") from None
     if ciphertext.startswith("fernet:"):
         try:
             return _fernet().decrypt(ciphertext.removeprefix("fernet:").encode("ascii")).decode("utf-8")

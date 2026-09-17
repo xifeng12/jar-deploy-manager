@@ -99,7 +99,7 @@ def test_connects_direct_with_password_and_custom_target_port():
         client = connection.client
 
     # Then
-    assert client.calls[-2] == (
+    assert client.calls[-1] == (
         "connect",
         {
             "hostname": "10.0.0.8",
@@ -132,10 +132,10 @@ def test_connects_jump_with_passwords_and_closes_every_resource():
 
     # Then
     jump, target = FakeClient.instances
-    assert jump.calls[-2][1]["hostname"] == "10.0.0.4"
-    assert jump.calls[-2][1]["password"] == "jump-password"
+    assert jump.calls[-1][1]["hostname"] == "10.0.0.4"
+    assert jump.calls[-1][1]["password"] == "jump-password"
     assert jump.transport.open_calls == [("direct-tcpip", ("10.0.0.8", 2202), ("", 0))]
-    assert target.calls[-2][1]["sock"] is jump.transport.channel
+    assert target.calls[-1][1]["sock"] is jump.transport.channel
     assert target.closed is True
     assert jump.transport.channel.closed is True
     assert jump.closed is True
@@ -161,10 +161,10 @@ def test_uses_private_key_for_jump_and_password_for_target(tmp_path):
 
     # Then
     jump, target = FakeClient.instances
-    assert jump.calls[-2][1]["key_filename"] == str(key_path)
-    assert jump.calls[-2][1]["passphrase"] == "jump-passphrase"
-    assert "password" not in jump.calls[-2][1]
-    assert target.calls[-2][1]["password"] == "server-password"
+    assert jump.calls[-1][1]["key_filename"] == str(key_path)
+    assert jump.calls[-1][1]["passphrase"] == "jump-passphrase"
+    assert "password" not in jump.calls[-1][1]
+    assert target.calls[-1][1]["password"] == "server-password"
 
 
 def test_uses_password_for_jump_and_private_key_for_target(tmp_path):
@@ -187,12 +187,12 @@ def test_uses_password_for_jump_and_private_key_for_target(tmp_path):
 
     # Then
     jump, target = FakeClient.instances
-    assert jump.calls[-2][1]["password"] == "jump-password"
-    assert target.calls[-2][1]["key_filename"] == str(key_path)
-    assert "password" not in target.calls[-2][1]
+    assert jump.calls[-1][1]["password"] == "jump-password"
+    assert target.calls[-1][1]["key_filename"] == str(key_path)
+    assert "password" not in target.calls[-1][1]
 
 
-def test_rejects_unknown_host_in_strict_mode_and_records_new_host(tmp_path):
+def test_selects_strict_or_atomic_accept_new_policy(tmp_path):
     # Given
     strict = ConnectionConfig(
         mode="direct",
@@ -218,8 +218,10 @@ def test_rejects_unknown_host_in_strict_mode_and_records_new_host(tmp_path):
     # Then
     strict_client, accept_new_client = FakeClient.instances
     assert ("set_policy", "strict") in strict_client.calls
-    assert ("set_policy", "accept-new") in accept_new_client.calls
-    assert any(call[0] == "save_host_keys" for call in accept_new_client.calls)
+    policy = next(call[1] for call in accept_new_client.calls if call[0] == "set_policy")
+    assert isinstance(policy, ssh_connection._AcceptNewHostKeyPolicy)
+    assert policy.known_hosts == tmp_path / "known_hosts"
+    assert not any(call[0] == "save_host_keys" for call in accept_new_client.calls)
 
 
 def test_cleans_jump_client_and_channel_when_target_connection_fails():

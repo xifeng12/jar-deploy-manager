@@ -4,6 +4,7 @@ import os
 import threading
 
 from runtime_paths import get_runtime_paths
+from jar_names import normalize_jar_name
 
 DB_PATH = str(get_runtime_paths().database)
 _lock = threading.Lock()
@@ -105,28 +106,43 @@ def get_server(ip):
     }
 
 
+def _check_jar_ownership(conn, jars, excluded_ips):
+    names = {normalize_jar_name(jar["name"] if isinstance(jar, dict) else jar) for jar in jars or []}
+    for row in conn.execute("SELECT ip, jars FROM servers"):
+        if row["ip"] in excluded_ips:
+            continue
+        for jar in json.loads(row["jars"]):
+            jar_name = normalize_jar_name(jar["name"] if isinstance(jar, dict) else jar)
+            if jar_name in names:
+                raise ValueError(f"{jar_name} 已归属服务器 {row['ip']}，一个JAR包只能归属一台服务器")
+
+
 def add_server(ip, jars=None, name=""):
     conn = get_conn()
     jars_json = json.dumps(jars or [], ensure_ascii=False)
-    with _lock:
+    with _lock, conn:
+        if conn.execute("SELECT 1 FROM servers WHERE ip=?", (ip,)).fetchone():
+            raise ValueError(f"服务器 {ip} 已存在")
+        _check_jar_ownership(conn, jars, set())
         conn.execute(
-            "INSERT OR REPLACE INTO servers (ip, name, jars, updated_at) VALUES (?, ?, ?, datetime('now','localtime'))",
+            "INSERT INTO servers (ip, name, jars, updated_at) VALUES (?, ?, ?, datetime('now','localtime'))",
             (ip, name or "", jars_json)
         )
-        conn.commit()
 
 
 def update_server(old_ip, ip, jars=None, name=""):
     conn = get_conn()
     jars_json = json.dumps(jars or [], ensure_ascii=False)
-    with _lock:
-        if old_ip != ip:
-            conn.execute("DELETE FROM servers WHERE ip=?", (old_ip,))
+    with _lock, conn:
+        if not conn.execute("SELECT 1 FROM servers WHERE ip=?", (old_ip,)).fetchone():
+            raise ValueError(f"服务器 {old_ip} 不存在")
+        if old_ip != ip and conn.execute("SELECT 1 FROM servers WHERE ip=?", (ip,)).fetchone():
+            raise ValueError(f"服务器 {ip} 已存在")
+        _check_jar_ownership(conn, jars, {old_ip})
         conn.execute(
-            "INSERT OR REPLACE INTO servers (ip, name, jars, updated_at) VALUES (?, ?, ?, datetime('now','localtime'))",
-            (ip, name or "", jars_json)
+            "UPDATE servers SET ip=?, name=?, jars=?, updated_at=datetime('now','localtime') WHERE ip=?",
+            (ip, name or "", jars_json, old_ip)
         )
-        conn.commit()
 
 
 def delete_server(ip):
