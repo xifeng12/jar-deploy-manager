@@ -150,7 +150,7 @@ def test_local_scripts_and_release_dependencies_are_pinned():
     assert "--host 0.0.0.0" not in package["scripts"]["dev"]
     assert "--host 0.0.0.0" not in package["scripts"]["preview"]
     assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in workflow
-    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d8705" in workflow
+    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in workflow
     assert "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" in workflow
     assert "actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08" in workflow
     assert "pyinstaller==6.21.0" in workflow
